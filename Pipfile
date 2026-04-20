@@ -1,0 +1,20 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+django = "*"
+django-ninja = "*"
+django-vite = "*"
+python-dotenv = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
+python_full_version = "3.11.9"
+
+[scripts]
+backend = "python manage.py runserver"
+frontend = "bash -c 'cd frontend && npm run dev'"
