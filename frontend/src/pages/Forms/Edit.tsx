@@ -46,15 +46,22 @@ import {
 } from "@/components/questions/registry"
 import type {
   JsonObject,
+  Logic,
+  Question,
   QuestionType,
 } from "@/components/questions/types"
+import { LogicSection } from "@/components/logic/logic-section"
+
+const LOGIC_SUPPORTED_TYPES: QuestionType[] = ["short_text", "multiple_choice"]
 
 type DraftQuestion = {
   uid: string
   type: QuestionType
   label: string
   required: boolean
+  hidden: boolean
   config: JsonObject
+  logic: Logic | null
 }
 
 type InitialQuestion = {
@@ -62,8 +69,10 @@ type InitialQuestion = {
   type: QuestionType
   label: string
   required: boolean
+  hidden?: boolean
   position: number
   config: JsonObject
+  logic?: Logic | null
 }
 
 type FormDetail = {
@@ -92,7 +101,9 @@ function fromInitial(q: InitialQuestion): DraftQuestion {
     type: q.type,
     label: q.label,
     required: q.required,
+    hidden: q.hidden ?? false,
     config: { ...defaultConfigFor(q.type), ...q.config },
+    logic: q.logic ?? null,
   }
 }
 
@@ -104,10 +115,99 @@ function putPayload(title: string, questions: DraftQuestion[]) {
       type: q.type,
       label: q.label,
       required: q.required,
+      hidden: q.hidden,
       position: idx,
       config: q.config,
+      logic: q.logic ?? null,
     })),
   }
+}
+
+// Rewrites temporary client uids to the real server UUIDs after a successful
+// autosave. Match by position (response is shorter than draft if the user
+// added a question between send and response). Only `uid` and
+// `logic.target_question_id` are touched; never overwrite user edits to
+// `label`, `config`, `required`, or `position`.
+function reconcileIds(
+  prevDraft: DraftQuestion[],
+  serverQuestions: { id: string; position: number }[],
+): DraftQuestion[] {
+  const byPosition = new Map<number, string>()
+  for (const sq of serverQuestions) byPosition.set(sq.position, sq.id)
+
+  const mapping: Record<string, string> = {}
+  prevDraft.forEach((q, idx) => {
+    const serverId = byPosition.get(idx)
+    if (!serverId) return
+    if (!UUID_RE.test(q.uid) && q.uid !== serverId) {
+      mapping[q.uid] = serverId
+    }
+  })
+
+  if (Object.keys(mapping).length === 0) return prevDraft
+
+  return prevDraft.map((q) => {
+    const nextUid = mapping[q.uid] ?? q.uid
+    const nextTarget =
+      q.logic && q.logic.target_question_id && mapping[q.logic.target_question_id]
+        ? mapping[q.logic.target_question_id]
+        : null
+    if (nextUid === q.uid && nextTarget === null) return q
+    return {
+      ...q,
+      uid: nextUid,
+      logic:
+        nextTarget !== null && q.logic
+          ? { ...q.logic, target_question_id: nextTarget }
+          : q.logic,
+    }
+  })
+}
+
+function toQuestion(q: DraftQuestion, idx: number): Question {
+  return {
+    id: q.uid,
+    type: q.type,
+    label: q.label,
+    required: q.required,
+    hidden: q.hidden,
+    position: idx,
+    config: q.config,
+    logic: q.logic,
+  }
+}
+
+// Keeps logic coherent across edits: drops rules pointing at deleted/unsupported
+// targets, clears partial value when a multiple_choice choice is removed,
+// and strips rules from questions whose type no longer supports logic.
+function normalizeLogic(qs: DraftQuestion[]): DraftQuestion[] {
+  const ids = new Set(qs.map((q) => q.uid))
+  let changed = false
+  const next = qs.map((q) => {
+    if (!q.logic) return q
+    if (!LOGIC_SUPPORTED_TYPES.includes(q.type)) {
+      changed = true
+      return { ...q, logic: null }
+    }
+    let nextLogic: Logic = q.logic
+    if (!ids.has(nextLogic.target_question_id)) {
+      nextLogic = { ...nextLogic, target_question_id: "" }
+      changed = true
+    }
+    if (q.type === "multiple_choice" && nextLogic.value != null) {
+      const choices = Array.isArray((q.config as { choices?: unknown }).choices)
+        ? ((q.config as { choices: unknown[] }).choices.filter(
+            (c): c is string => typeof c === "string",
+          ))
+        : []
+      if (!choices.includes(String(nextLogic.value))) {
+        nextLogic = { ...nextLogic, value: null }
+        changed = true
+      }
+    }
+    return nextLogic === q.logic ? q : { ...q, logic: nextLogic }
+  })
+  return changed ? next : qs
 }
 
 export default function FormsEdit() {
@@ -151,7 +251,9 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
   const [title, setTitle] = useState(detail.title)
   const [status, setStatus] = useState<"draft" | "published">(detail.status)
   const [questions, setQuestions] = useState<DraftQuestion[]>(
-    detail.questions.length > 0 ? detail.questions.map(fromInitial) : [],
+    detail.questions.length > 0
+      ? normalizeLogic(detail.questions.map(fromInitial))
+      : [],
   )
   const [hasUnpublishedChanges, setHasUnpublishedChanges] = useState(
     detail.has_unpublished_changes,
@@ -159,6 +261,7 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
   const form = { id: detail.id }
   const [publishing, setPublishing] = useState(false)
   const [discarding, setDiscarding] = useState(false)
+  const [publishErrors, setPublishErrors] = useState<Record<string, string>>({})
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -196,10 +299,32 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
       )
       if (!res.ok) return
       const data = (await res.json().catch(() => null)) as
-        | { has_unpublished_changes?: boolean }
+        | {
+            has_unpublished_changes?: boolean
+            questions?: { id: string; position: number }[]
+          }
         | null
       if (data && typeof data.has_unpublished_changes === "boolean") {
         setHasUnpublishedChanges(data.has_unpublished_changes)
+      }
+      if (data && Array.isArray(data.questions)) {
+        const serverQuestions = data.questions
+        setQuestions((prev) => {
+          const next = reconcileIds(prev, serverQuestions)
+          if (next !== prev) {
+            let targetRewritten = false
+            for (let i = 0; i < next.length; i++) {
+              const prevTarget = prev[i]?.logic?.target_question_id ?? null
+              const nextTarget = next[i]?.logic?.target_question_id ?? null
+              if (prevTarget !== nextTarget) {
+                targetRewritten = true
+                break
+              }
+            }
+            if (!targetRewritten) skipNextAutosave.current = true
+          }
+          return next
+        })
       }
     }, AUTOSAVE_DELAY_MS)
     return () => {
@@ -225,23 +350,55 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
   }, [form.id])
 
   function updateQuestion(uid: string, patch: Partial<DraftQuestion>) {
-    setQuestions((qs) => qs.map((q) => (q.uid === uid ? { ...q, ...patch } : q)))
+    setQuestions((qs) =>
+      normalizeLogic(qs.map((q) => (q.uid === uid ? { ...q, ...patch } : q))),
+    )
   }
 
   function updateQuestionConfig(uid: string, patch: JsonObject) {
     setQuestions((qs) =>
-      qs.map((q) => (q.uid === uid ? { ...q, config: { ...q.config, ...patch } } : q)),
+      normalizeLogic(
+        qs.map((q) =>
+          q.uid === uid ? { ...q, config: { ...q.config, ...patch } } : q,
+        ),
+      ),
     )
+  }
+
+  function updateQuestionLogic(uid: string, logic: Logic | null) {
+    setQuestions((qs) =>
+      qs.map((q) => (q.uid === uid ? { ...q, logic } : q)),
+    )
+    setPublishErrors((errs) => {
+      const idx = questionsRef.current.findIndex((q) => q.uid === uid)
+      if (idx < 0) return errs
+      const key = `questions.${idx}.logic`
+      if (!(key in errs)) return errs
+      const rest = { ...errs }
+      delete rest[key]
+      return rest
+    })
   }
 
   function changeQuestionType(uid: string, type: QuestionType) {
     setQuestions((qs) =>
-      qs.map((q) => (q.uid === uid ? { ...q, type, config: defaultConfigFor(type) } : q)),
+      normalizeLogic(
+        qs.map((q) =>
+          q.uid === uid
+            ? {
+                ...q,
+                type,
+                config: defaultConfigFor(type),
+                logic: LOGIC_SUPPORTED_TYPES.includes(type) ? q.logic : null,
+              }
+            : q,
+        ),
+      ),
     )
   }
 
   function removeQuestion(uid: string) {
-    setQuestions((qs) => qs.filter((q) => q.uid !== uid))
+    setQuestions((qs) => normalizeLogic(qs.filter((q) => q.uid !== uid)))
   }
 
   function addQuestion() {
@@ -252,7 +409,9 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
         type: "short_text",
         label: "",
         required: false,
+        hidden: false,
         config: defaultConfigFor("short_text"),
+        logic: null,
       },
     ])
   }
@@ -264,7 +423,7 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
       const from = qs.findIndex((q) => q.uid === active.id)
       const to = qs.findIndex((q) => q.uid === over.id)
       if (from < 0 || to < 0) return qs
-      return arrayMove(qs, from, to)
+      return normalizeLogic(arrayMove(qs, from, to))
     })
   }
 
@@ -286,13 +445,16 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
       if (res.ok) {
         setStatus("published")
         setHasUnpublishedChanges(false)
+        setPublishErrors({})
         toast.success("Form published")
         return
       }
       const data = (await res.json().catch(() => ({}))) as {
         errors?: Record<string, string>
       }
-      const first = Object.values(data.errors ?? {})[0]
+      const errors = data.errors ?? {}
+      setPublishErrors(errors)
+      const first = Object.values(errors)[0]
       toast.error(first ?? "Could not publish form")
     } finally {
       setPublishing(false)
@@ -315,6 +477,7 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
         data.questions.length > 0 ? data.questions.map(fromInitial) : [],
       )
       setHasUnpublishedChanges(false)
+      setPublishErrors({})
       toast.success("Changes discarded")
     } finally {
       setDiscarding(false)
@@ -383,18 +546,25 @@ function FormsEditInner({ detail }: { detail: FormDetail }) {
             strategy={verticalListSortingStrategy}
           >
             <ul className="flex flex-col gap-3">
-              {questions.map((q, i) => (
-                <li key={q.uid}>
-                  <SortableQuestion
-                    index={i}
-                    question={q}
-                    onPatch={(patch) => updateQuestion(q.uid, patch)}
-                    onConfigPatch={(patch) => updateQuestionConfig(q.uid, patch)}
-                    onTypeChange={(t) => changeQuestionType(q.uid, t)}
-                    onRemove={() => removeQuestion(q.uid)}
-                  />
-                </li>
-              ))}
+              {(() => {
+                const allQuestionsView = questions.map(toQuestion)
+                return questions.map((q, i) => (
+                  <li key={q.uid}>
+                    <SortableQuestion
+                      index={i}
+                      question={q}
+                      questionView={allQuestionsView[i]}
+                      allQuestions={allQuestionsView}
+                      logicError={publishErrors[`questions.${i}.logic`]}
+                      onPatch={(patch) => updateQuestion(q.uid, patch)}
+                      onConfigPatch={(patch) => updateQuestionConfig(q.uid, patch)}
+                      onTypeChange={(t) => changeQuestionType(q.uid, t)}
+                      onLogicChange={(logic) => updateQuestionLogic(q.uid, logic)}
+                      onRemove={() => removeQuestion(q.uid)}
+                    />
+                  </li>
+                ))
+              })()}
             </ul>
           </SortableContext>
         </DndContext>
@@ -451,16 +621,24 @@ function ChangesPill({
 function SortableQuestion({
   index,
   question,
+  questionView,
+  allQuestions,
+  logicError,
   onPatch,
   onConfigPatch,
   onTypeChange,
+  onLogicChange,
   onRemove,
 }: {
   index: number
   question: DraftQuestion
+  questionView: Question
+  allQuestions: Question[]
+  logicError?: string
   onPatch: (patch: Partial<DraftQuestion>) => void
   onConfigPatch: (patch: JsonObject) => void
   onTypeChange: (type: QuestionType) => void
+  onLogicChange: (logic: Logic | null) => void
   onRemove: () => void
 }) {
   const {
@@ -538,6 +716,14 @@ function SortableQuestion({
               />
               Required
             </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-brand-ink/70">
+              <Checkbox
+                checked={question.hidden}
+                onCheckedChange={(c) => onPatch({ hidden: c === true })}
+                className="size-4 data-checked:border-brand-green data-checked:bg-brand-green data-checked:text-white"
+              />
+              Hidden
+            </label>
             <button
               type="button"
               onClick={onRemove}
@@ -561,6 +747,13 @@ function SortableQuestion({
               onChange={(patch) => onConfigPatch(patch as JsonObject)}
             />
           )}
+
+          <LogicSection
+            question={questionView}
+            allQuestions={allQuestions}
+            onChange={onLogicChange}
+            error={logicError}
+          />
         </div>
       </div>
     </BrandCard>

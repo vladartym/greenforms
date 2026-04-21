@@ -14,6 +14,7 @@ The minimum we ship and can demo end-to-end.
 - Discard pending changes on a published form to revert to the last-published version.
 - Preview a form as a respondent before publishing.
 - View completed responses for a form in a card or table view.
+- Attach conditional jump-to-question logic to short-text and multiple-choice questions (single rule, equals / not-equals). See [§9](./09-conditional-logic.md).
 
 ### Field types (13)
 
@@ -44,7 +45,6 @@ Full per-type specs live in [`docs/questions/`](../questions/). Palette overview
 
 Build if time permits, after MVP is solid.
 
-- **Logic / branching.** "If answer to Q3 is X, skip to Q5." Touches the data model (conditional next-question rules) and both UIs (creator-side rule editor, respondent-side traversal).
 - **CSV export of responses.** Download button on the responses page.
 - **Cross-session resume.** Cookie-backed draft so a respondent can close the tab and pick up later (infra exists, UX not wired up).
 - **Drop-off visibility.** Show in-progress drafts with a "last question reached" marker alongside completed responses.
@@ -67,7 +67,7 @@ Deliberately not in this iteration.
 - **Publish workflow:** MVP — draft → published with config validation; discard reverts to the last-published snapshot.
 - **Form duplication:** MVP.
 - **Preview:** MVP — creators can walk through the form as a respondent before publishing.
-- **Logic / branching:** stretch, after MVP.
+- **Logic / branching:** MVP, minimal scope (jump-to-question, single rule, equals / not-equals, short-text + multiple-choice only). See [§9](./09-conditional-logic.md).
 - **CSV export:** stretch.
 - **Cross-session resume / drop-off visibility:** stretch.
 - **Out-of-scope categories:** teams/permissions, integrations, payments, custom welcome/thank-you screens, additional field types, production concerns.

@@ -26,8 +26,10 @@ Discarding changes on a published form restores `title` and the live questions f
 - `type` — one of 13 question types; per-type specs in [`docs/questions/`](../questions/). Current values: `short_text`, `long_text`, `multiple_choice`, `email`, `dropdown`, `number`, `phone_number`, `file_upload`, `date`, `time`, `linear_scale`, `rating`, `ranking`.
 - `label`
 - `required` — bool
+- `hidden` — bool (default false; hidden questions are skipped by the respondent's position-based traversal but remain legal jump targets, see [§9](./09-conditional-logic.md))
 - `position` — int (order within the form)
 - `config` — JSON (type-specific settings; e.g. `{"choices": [...], "allow_multiple": false}` for multiple choice; `{"min": 1, "max": 5, "min_label": "...", "max_label": "..."}` for linear scale; `{"integer": true}` for number; `{}` for plain text types). See each type's doc for its exact shape.
+- `logic`: JSON (nullable; single jump rule when present: `{"operator": "equals" | "not_equals", "value": ..., "target_question_id": "<uuid>"}`). See [§9](./09-conditional-logic.md).
 
 ### `Response`
 - `id` (UUID)
@@ -42,7 +44,7 @@ Discarding changes on a published form restores `title` and the live questions f
 - `response` → `Response`
 - `question` → `Question` (nullable; `SET_NULL` when the question is deleted so the answer survives)
 - `value` — JSON (shape depends on the question's type; string for text / email / dropdown, array for ranking and multi-select multiple choice, number for numeric types, object for file upload). See each type's doc under [`docs/questions/`](../questions/) for the exact shape.
-- `question_label`, `question_type`, `question_position`, `question_config` — snapshot of the question taken at write time so the answer remains readable even if the question is later edited or deleted
+- `question_label`, `question_type`, `question_position`, `question_config`, `question_logic`, `question_hidden` — snapshot of the question taken at write time so the answer remains readable even if the question is later edited or deleted
 
 ### `Upload`
 Separate table so uploaded files don't bloat `Answer.value` and can be cleaned up independently.
@@ -70,6 +72,7 @@ User 1—N Form 1—N Question
 - **Required validation** is enforced at submit time and at "advance past this question" time on the respondent side.
 - **JSON for `config` and `value`** keeps the schema flat and easy to extend when we add field types later.
 - **Publish snapshots** (`published_title`, `published_questions`) and per-response snapshots (`questions_snapshot`, per-answer snapshot fields) together guarantee that responses stay readable even after the creator edits or deletes questions.
+- **Logic snapshots** ride the same mechanism as `config`: `Question.logic` is included in `Form.published_questions`, `Response.questions_snapshot`, and per-answer `question_logic`, so the respondent's path is stable across re-publishes.
 
 ## Decisions
 

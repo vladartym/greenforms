@@ -32,6 +32,14 @@ export type AnswerValue =
 
 export type JsonObject = Record<string, unknown>
 
+export type LogicOperator = "equals" | "not_equals"
+
+export type Logic = {
+  operator: LogicOperator
+  value: unknown
+  target_question_id: string
+}
+
 export type Question<C extends JsonObject = JsonObject> = {
   id: string
   type: QuestionType
@@ -39,6 +47,8 @@ export type Question<C extends JsonObject = JsonObject> = {
   required: boolean
   position: number
   config: C
+  logic?: Logic | null
+  hidden: boolean
 }
 
 export type RendererProps<V extends AnswerValue = AnswerValue, C extends JsonObject = JsonObject> = {

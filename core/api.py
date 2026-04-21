@@ -1,6 +1,6 @@
 import uuid
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal, Optional
 
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
@@ -121,6 +121,13 @@ def api_logout(request):
 api.add_router("/auth", auth_router)
 
 
+class LogicSchema(Schema):
+    model_config = ConfigDict(extra="forbid")
+    operator: Literal["equals", "not_equals"]
+    value: Any
+    target_question_id: str
+
+
 class QuestionIn(Schema):
     model_config = ConfigDict(extra="forbid")
     id: str | None = None
@@ -129,6 +136,8 @@ class QuestionIn(Schema):
     required: bool = False
     position: int
     config: dict = {}
+    logic: Optional[LogicSchema] = None
+    hidden: bool = False
 
 
 class FormWriteIn(Schema):
@@ -145,6 +154,8 @@ class QuestionOut(Schema):
     required: bool
     position: int
     config: dict
+    logic: Optional[LogicSchema] = None
+    hidden: bool = False
 
 
 class FormOut(Schema):
@@ -256,6 +267,11 @@ def _publish_errors(payload: FormWriteIn) -> dict[str, str]:
         Question.Type.DROPDOWN,
         Question.Type.RANKING,
     }
+    logic_supported_types = {
+        Question.Type.SHORT_TEXT,
+        Question.Type.MULTIPLE_CHOICE,
+    }
+    questions_by_id = {q.id: q for q in payload.questions if q.id}
     for idx, q in enumerate(payload.questions):
         prefix = f"questions.{idx}"
         cfg = q.config if isinstance(q.config, dict) else {}
@@ -282,6 +298,41 @@ def _publish_errors(payload: FormWriteIn) -> dict[str, str]:
             lo, hi = cfg.get("min"), cfg.get("max")
             if lo is not None and hi is not None and lo >= hi:
                 errors[f"{prefix}.range"] = "Min must be less than max."
+
+        if q.logic is not None:
+            logic_key = f"{prefix}.logic"
+            if q.type not in logic_supported_types:
+                errors[logic_key] = (
+                    "Logic is only supported on short text and multiple choice questions in MVP."
+                )
+                continue
+
+            operator = q.logic.operator
+            value = q.logic.value
+            target_id = q.logic.target_question_id
+            if (
+                not operator
+                or not target_id
+                or value is None
+                or (isinstance(value, str) and value == "")
+            ):
+                errors[logic_key] = "Complete the logic rule, or remove it."
+                continue
+
+            target = questions_by_id.get(target_id)
+            if target is None:
+                errors[logic_key] = "Target question not found."
+                continue
+
+            if target.position <= q.position:
+                errors[logic_key] = "Logic target must be a later question."
+                continue
+
+            if q.type == Question.Type.MULTIPLE_CHOICE:
+                choices = cfg.get("choices") if isinstance(cfg.get("choices"), list) else []
+                if value not in choices:
+                    errors[logic_key] = "Logic value must be one of the question's choices."
+                    continue
     return errors
 
 
@@ -294,6 +345,8 @@ def _serialize_live_questions(form: Form) -> list[dict]:
             "required": q.required,
             "position": q.position,
             "config": q.config or {},
+            "logic": q.logic,
+            "hidden": q.hidden,
         }
         for q in form.questions.order_by("position")
     ]
@@ -311,6 +364,8 @@ def _form_payload_for_publish(form: Form) -> FormWriteIn:
                 required=q.required,
                 position=q.position,
                 config=q.config or {},
+                logic=q.logic,
+                hidden=q.hidden,
             )
             for q in form.questions.order_by("position")
         ],
@@ -327,12 +382,32 @@ def _form_out(form: Form) -> dict:
     }
 
 
+def _form_detail(form: Form) -> dict:
+    return {
+        **_form_out(form),
+        "questions": [
+            {
+                "id": str(q.id),
+                "type": q.type,
+                "label": q.label,
+                "required": q.required,
+                "position": q.position,
+                "config": q.config or {},
+                "logic": q.logic,
+                "hidden": q.hidden,
+            }
+            for q in form.questions.order_by("position")
+        ],
+    }
+
+
 def _write_questions(form: Form, questions: list[QuestionIn]) -> None:
     existing = {str(q.id): q for q in form.questions.all()}
     incoming_ids: set[str] = set()
 
     for idx, q in enumerate(questions):
         config = q.config if isinstance(q.config, dict) else {}
+        logic = q.logic.dict() if q.logic is not None else None
         label = q.label.strip()
         existing_question = existing.get(q.id) if q.id else None
         if existing_question is not None:
@@ -341,8 +416,10 @@ def _write_questions(form: Form, questions: list[QuestionIn]) -> None:
             existing_question.required = q.required
             existing_question.position = idx
             existing_question.config = config
+            existing_question.logic = logic
+            existing_question.hidden = q.hidden
             existing_question.save(
-                update_fields=["type", "label", "required", "position", "config"]
+                update_fields=["type", "label", "required", "position", "config", "logic", "hidden"]
             )
             incoming_ids.add(str(existing_question.id))
         else:
@@ -353,6 +430,8 @@ def _write_questions(form: Form, questions: list[QuestionIn]) -> None:
                 required=q.required,
                 position=idx,
                 config=config,
+                logic=logic,
+                hidden=q.hidden,
             )
             incoming_ids.add(str(created.id))
 
@@ -398,13 +477,15 @@ def get_form(request, form_id: str):
                 "required": q.required,
                 "position": q.position,
                 "config": q.config,
+                "logic": q.logic,
+                "hidden": q.hidden,
             }
             for q in form.questions.order_by("position")
         ],
     }
 
 
-@forms_router.put("/{form_id}", response={200: FormOut, 400: ErrorOut, 404: ErrorOut}, auth=django_auth)
+@forms_router.put("/{form_id}", response={200: FormDetailOut, 400: ErrorOut, 404: ErrorOut}, auth=django_auth)
 def update_form(request, form_id: str, payload: FormWriteIn):
     try:
         form = request.user.forms.get(id=form_id)
@@ -424,7 +505,7 @@ def update_form(request, form_id: str, payload: FormWriteIn):
         form.save(update_fields=update_fields)
         _write_questions(form, payload.questions)
 
-    return 200, _form_out(form)
+    return 200, _form_detail(form)
 
 
 @forms_router.post(
@@ -494,6 +575,8 @@ def discard_form_changes(request, form_id: str):
                 required=snap.get("required", False),
                 position=snap["position"],
                 config=snap.get("config") or {},
+                logic=snap.get("logic"),
+                hidden=snap.get("hidden", False),
             )
 
     return 200, {
@@ -510,6 +593,8 @@ def discard_form_changes(request, form_id: str):
                 "required": q.required,
                 "position": q.position,
                 "config": q.config,
+                "logic": q.logic,
+                "hidden": q.hidden,
             }
             for q in form.questions.order_by("position")
         ],
@@ -573,6 +658,8 @@ def duplicate_form(request, form_id: str):
                     required=q.required,
                     position=q.position,
                     config=q.config,
+                    logic=q.logic,
+                    hidden=q.hidden,
                 )
                 for q in form.questions.order_by("position")
             ]
@@ -667,6 +754,8 @@ def get_public_form(request, form_id: str):
                 "required": q.get("required", False),
                 "position": q["position"],
                 "config": q.get("config") or {},
+                "logic": q.get("logic"),
+                "hidden": q.get("hidden", False),
             }
             for q in snapshot
         ],
@@ -746,15 +835,26 @@ def save_answer(request, response_id: str, question_id: str, payload: AnswerIn):
             "question_type": question.type,
             "question_position": question.position,
             "question_config": question.config or {},
+            "question_logic": question.logic,
+            "question_hidden": question.hidden,
         },
     )
     return 200, {"ok": True}
 
 
+class SubmitIn(Schema):
+    model_config = ConfigDict(extra="forbid")
+    path: Optional[list[str]] = None
+
+
 @responses_router.post(
     "/{response_id}/submit", response={200: OkOut, 400: ErrorOut, 404: ErrorOut}
 )
-def submit_response(request, response_id: str):
+def submit_response(request, response_id: str, payload: SubmitIn = None):
+    path_ids: Optional[set[str]] = None
+    if payload is not None and payload.path:
+        path_ids = {str(pid) for pid in payload.path}
+
     try:
         with transaction.atomic():
             try:
@@ -764,6 +864,9 @@ def submit_response(request, response_id: str):
             if response.status == FormResponse.Status.COMPLETED:
                 return 400, {"errors": {"response": "Response already submitted."}}
 
+            if path_ids is not None:
+                response.answers.exclude(question_id__in=path_ids).delete()
+
             snapshot = response.questions_snapshot or []
             answers_map = {
                 str(a.question_id): a.value for a in response.answers.all()
@@ -772,6 +875,8 @@ def submit_response(request, response_id: str):
             errors: dict[str, str] = {}
             for snap in snapshot:
                 qid = str(snap.get("id"))
+                if path_ids is not None and qid not in path_ids:
+                    continue
                 value = answers_map.get(qid)
                 if snap.get("required") and is_empty(value):
                     errors[qid] = "This question is required."

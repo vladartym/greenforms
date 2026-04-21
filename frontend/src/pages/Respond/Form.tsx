@@ -110,7 +110,7 @@ function RespondFormInner({
     return true
   }
 
-  const submitResponse = async (): Promise<boolean> => {
+  const submitResponse = async (path: string[]): Promise<boolean> => {
     if (!responseId) return false
     const url = `/api/responses/${responseId}/submit`
     const backoffsMs = [0, 600, 1800, 3600]
@@ -119,7 +119,7 @@ function RespondFormInner({
         await new Promise((r) => setTimeout(r, backoffsMs[attempt]))
       }
       try {
-        const res = await postJSON(url, {})
+        const res = await postJSON(url, { path })
         if (res.ok) return true
         if (res.status >= 400 && res.status < 500) {
           await toastBackendError(res, "Couldn't submit. Try again.")

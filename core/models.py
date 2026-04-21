@@ -57,6 +57,8 @@ class Question(models.Model):
     required = models.BooleanField(default=False)
     position = models.PositiveIntegerField()
     config = models.JSONField(default=dict, blank=True)
+    logic = models.JSONField(null=True, blank=True, default=None)
+    hidden = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["position"]
@@ -126,3 +128,5 @@ class Answer(models.Model):
     question_type = models.CharField(max_length=32, blank=True)
     question_position = models.PositiveIntegerField(default=0)
     question_config = models.JSONField(default=dict, blank=True)
+    question_logic = models.JSONField(null=True, blank=True, default=None)
+    question_hidden = models.BooleanField(default=False)

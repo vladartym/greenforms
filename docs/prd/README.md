@@ -14,6 +14,7 @@ Each section is its own document so it can be read, edited, and referenced indep
 6. [API design](./06-api-design.md) — endpoints / actions, request & response shapes
 7. [Testing & quality](./07-testing.md) — what we test and what we don't
 8. [Open questions](./08-open-questions.md) — design problems still on the table
+9. [Conditional logic](./09-conditional-logic.md): minimal jump-to-question rules
 
 ## How to read this
 

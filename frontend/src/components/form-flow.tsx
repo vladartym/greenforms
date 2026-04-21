@@ -1,4 +1,6 @@
 import {
+  useEffect,
+  useMemo,
   useState,
   type KeyboardEvent,
   type ReactNode,
@@ -11,6 +13,7 @@ import { cn } from "@/lib/utils"
 import { QUESTION_TYPES } from "@/components/questions/registry"
 import type {
   AnswerValue,
+  Logic,
   Question,
   QuestionType,
 } from "@/components/questions/types"
@@ -22,7 +25,7 @@ type Props = {
   className?: string
   skipValidation?: boolean
   onAdvance?: (questionId: string, value: AnswerValue) => Promise<boolean>
-  onComplete?: () => Promise<boolean>
+  onComplete?: (path: string[]) => Promise<boolean>
   disabled?: boolean
   header?: ReactNode
   completion?: ReactNode
@@ -38,6 +41,62 @@ function isEmpty(value: AnswerValue): boolean {
   return false
 }
 
+// Returns true if `answer` is considered equal to the logic's `value` for the
+// purposes of conditional branching. Only short_text and multiple_choice are
+// valid trigger types per the PRD.
+function answerMatchesLogicValue(
+  question: Question,
+  answer: AnswerValue,
+  logicValue: unknown,
+): boolean {
+  if (question.type === "short_text") {
+    const a = typeof answer === "string" ? answer.trim() : ""
+    const b = typeof logicValue === "string" ? logicValue.trim() : ""
+    return a === b
+  }
+  if (question.type === "multiple_choice") {
+    if (Array.isArray(answer)) {
+      // allow_multiple=true: match when the one selected value equals logicValue.
+      return answer.length === 1 && answer[0] === logicValue
+    }
+    return answer === logicValue
+  }
+  return false
+}
+
+function nextByPosition(
+  current: Question,
+  snapshot: Question[],
+): Question | null {
+  const sorted = [...snapshot].sort((a, b) => a.position - b.position)
+  const idx = sorted.findIndex((q) => q.id === current.id)
+  if (idx === -1) return null
+  for (let i = idx + 1; i < sorted.length; i++) {
+    if (!sorted[i].hidden) return sorted[i]
+  }
+  return null
+}
+
+function evaluateLogic(
+  question: Question,
+  answer: AnswerValue,
+  snapshot: Question[],
+): Question | null {
+  const logic: Logic | null | undefined = question.logic
+  if (logic && logic.operator && logic.target_question_id) {
+    const matches = answerMatchesLogicValue(question, answer, logic.value)
+    const shouldJump =
+      (logic.operator === "equals" && matches) ||
+      (logic.operator === "not_equals" && !matches)
+    if (shouldJump) {
+      // Explicit jumps override the hidden-skip default, so target.hidden is ignored here.
+      const target = snapshot.find((q) => q.id === logic.target_question_id)
+      if (target) return target
+    }
+  }
+  return nextByPosition(question, snapshot)
+}
+
 export function FormFlow({
   questions,
   className = DEFAULT_CLASS,
@@ -49,11 +108,53 @@ export function FormFlow({
   completion,
 }: Props) {
   const total = questions.length
-  const [index, setIndex] = useState(0)
+
+  const sortedQuestions = useMemo(
+    () => [...questions].sort((a, b) => a.position - b.position),
+    [questions],
+  )
+  const firstVisibleId =
+    sortedQuestions.find((q) => !q.hidden)?.id ?? null
+
+  const [stack, setStack] = useState<string[]>(() =>
+    firstVisibleId ? [firstVisibleId] : [],
+  )
   const [direction, setDirection] = useState<1 | -1>(1)
   const [answers, setAnswers] = useState<Record<string, AnswerValue>>({})
   const [busy, setBusy] = useState(false)
   const [completed, setCompleted] = useState(false)
+
+  // If every question is hidden, the starting stack is empty. Auto-complete
+  // with an empty path so the form doesn't render a broken state.
+  const shouldAutoComplete = total > 0 && stack.length === 0 && !completed
+  useEffect(() => {
+    if (!shouldAutoComplete || busy) return
+    let cancelled = false
+    const run = async () => {
+      setBusy(true)
+      if (onComplete) {
+        const ok = await onComplete([])
+        if (cancelled) return
+        if (!ok) {
+          setBusy(false)
+          return
+        }
+      }
+      if (cancelled) return
+      setCompleted(true)
+      setBusy(false)
+    }
+    run()
+    return () => {
+      cancelled = true
+    }
+  }, [shouldAutoComplete, busy, onComplete])
+
+  const questionById = useMemo(() => {
+    const map: Record<string, Question> = {}
+    for (const q of questions) map[q.id] = q
+    return map
+  }, [questions])
 
   if (total === 0) {
     return (
@@ -63,10 +164,27 @@ export function FormFlow({
     )
   }
 
-  const question = questions[index]
-  const isFirst = index === 0
-  const isLast = index === total - 1
-  const progress = ((index + 1) / total) * 100
+  const currentId = stack[stack.length - 1] ?? firstVisibleId
+  const question = currentId ? questionById[currentId] : undefined
+
+  if (!question) {
+    // All questions hidden or none visited yet. If a completion slot was provided
+    // render it once the auto-complete effect has run; otherwise show a neutral
+    // placeholder so the UI doesn't crash.
+    return (
+      <main className={cn(className, "items-center justify-center")}>
+        {completed && completion ? (
+          completion
+        ) : (
+          <Body className="text-brand-ink/60">This form has no questions yet.</Body>
+        )}
+      </main>
+    )
+  }
+
+  const isFirst = stack.length <= 1
+  const visitedCount = stack.length
+  const progress = (visitedCount / total) * 100
 
   const setAnswer = (value: AnswerValue) =>
     setAnswers((prev) => ({ ...prev, [question.id]: value }))
@@ -86,9 +204,13 @@ export function FormFlow({
         return
       }
     }
-    if (isLast) {
+
+    const next = evaluateLogic(question, current, questions)
+
+    if (!next) {
+      const finalPath = [...stack]
       if (onComplete) {
-        const ok = await onComplete()
+        const ok = await onComplete(finalPath)
         if (!ok) {
           setBusy(false)
           return
@@ -98,20 +220,21 @@ export function FormFlow({
       setBusy(false)
       return
     }
+
     setDirection(1)
-    setIndex((i) => Math.min(i + 1, total - 1))
+    // Truncate any forward history past the current question, then push next.
+    setStack((prev) => {
+      const idx = prev.lastIndexOf(question.id)
+      const truncated = idx === -1 ? prev : prev.slice(0, idx + 1)
+      return [...truncated, next.id]
+    })
     setBusy(false)
   }
 
   const goBack = async () => {
     if (busy || disabled || isFirst || completed) return
-    setBusy(true)
-    if (onAdvance) {
-      await onAdvance(question.id, answers[question.id] ?? null)
-    }
     setDirection(-1)
-    setIndex((i) => Math.max(i - 1, 0))
-    setBusy(false)
+    setStack((prev) => prev.slice(0, -1))
   }
 
   const handleKeyDown = (e: KeyboardEvent<HTMLElement>) => {
@@ -159,7 +282,7 @@ export function FormFlow({
             >
               <div className="space-y-3">
                 <div className="text-sm font-sans text-brand-ink/50">
-                  {index + 1}
+                  {visitedCount}
                 </div>
                 <H1 className="text-[clamp(1.75rem,4vw,36px)] leading-[1.2]">
                   {question.label}
@@ -197,7 +320,9 @@ export function FormFlow({
                   onClick={goNext}
                   disabled={busy || disabled}
                 >
-                  {isLast ? "Submit" : "Next"}
+                  {nextByPosition(question, questions) || question.logic
+                    ? "Next"
+                    : "Submit"}
                 </PillButton>
                 <span className="text-xs text-brand-ink/40">
                   press Enter
@@ -212,7 +337,7 @@ export function FormFlow({
       {!completed && (
         <div className="pointer-events-none absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-3 sm:left-auto sm:right-10 sm:translate-x-0">
           <span className="text-sm text-brand-ink/60">
-            {index + 1} of {total}
+            {visitedCount} of {total}
           </span>
           <div
             className="h-1 w-32 overflow-hidden rounded-full bg-brand-ink/10"
